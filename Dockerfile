@@ -36,15 +36,17 @@ RUN echo "[build] Cloning Hermes Agent..." && START=$(date +%s) \
 
 WORKDIR /opt/hermes
 
-# ── Node dependencies + Playwright ───────────────────────────────────────
+# ── Node dependencies + Playwright + Web Dashboard build ─────────────────
 RUN echo "[build] Installing Node deps + Playwright..." && START=$(date +%s) \
   && npm install --prefer-offline --no-audit \
   && npx playwright install --with-deps chromium --only-shell \
   && if [ -d /opt/hermes/scripts/whatsapp-bridge ]; then \
        cd /opt/hermes/scripts/whatsapp-bridge && npm install --prefer-offline --no-audit; \
      fi \
-  && npm cache clean --force \
-  && echo "[build] Node deps: $(($(date +%s) - START))s"
+  && echo "[build] Building web dashboard..." \
+  && cd /opt/hermes/web && npm install --prefer-offline --no-audit && npm run build \
+  && cd /opt/hermes && npm cache clean --force \
+  && echo "[build] Node deps + web dashboard: $(($(date +%s) - START))s"
 
 # ── Python dependencies ──────────────────────────────────────────────────
 RUN chown -R hermes:hermes /opt/hermes
