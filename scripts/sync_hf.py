@@ -431,6 +431,14 @@ pre {{ background: #161b22; padding: 16px; border-radius: 8px; overflow-x: auto;
         env = os.environ.copy()
         env["HERMES_HOME"] = str(HERMES_DATA)
 
+        # Enable API server on port 7860 for HF Spaces (OpenAI-compatible endpoint)
+        # This provides /health, /v1/chat/completions, /v1/models, etc.
+        env["API_SERVER_ENABLED"] = "true"
+        env["API_SERVER_PORT"] = "7860"
+        env["API_SERVER_HOST"] = "0.0.0.0"
+        env["API_SERVER_CORS_ORIGINS"] = "https://huggingface.co,https://*.hf.space"
+        print("[SYNC] API server configured on port 7860 (OpenAI-compatible)")
+
         try:
             process = subprocess.Popen(
                 entry_cmd,
@@ -496,9 +504,15 @@ def main():
         t.start()
 
         # 3. Start health check HTTP server (port 7860 — required by HF Spaces)
+        # Serves a status page while Hermes gateway boots up.
         health_server = sync.start_health_server()
 
         # 4. Start application
+        # Shutdown health server before Hermes starts (API server will take port 7860)
+        print("[SYNC] Stopping health server (API server will take port 7860)...")
+        health_server.shutdown()
+        time.sleep(1)
+
         t0 = time.time()
         process = sync.run_hermes()
         if process and hasattr(sync, '_hermes_process_ref'):
