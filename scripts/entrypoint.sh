@@ -3,7 +3,7 @@ set -e
 
 BOOT_START=$(date +%s)
 
-echo "[entrypoint] HuggingHermes — Hermes Agent on HuggingFace Spaces"
+echo "[entrypoint] HermesFace — Hermes Agent on HuggingFace Spaces"
 echo "[entrypoint] ===================================================="
 
 HERMES_HOME="/opt/data"

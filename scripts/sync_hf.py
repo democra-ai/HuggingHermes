@@ -60,7 +60,7 @@ HERMES_DATA   = Path("/opt/data")
 APP_DIR       = Path("/opt/hermes")
 DATASET_PATH  = "hermes_data"
 
-AGENT_NAME = os.environ.get("AGENT_NAME", "HuggingHermes")
+AGENT_NAME = os.environ.get("AGENT_NAME", "HermesFace")
 
 # HF Spaces built-in env vars (auto-set by HF runtime)
 SPACE_HOST = os.environ.get("SPACE_HOST", "")
@@ -79,7 +79,7 @@ elif not HF_REPO_ID and HF_TOKEN:
     try:
         _api = HfApi(token=HF_TOKEN)
         _username = _api.whoami()["name"]
-        HF_REPO_ID = f"{_username}/HuggingHermes-data"
+        HF_REPO_ID = f"{_username}/HermesFace-data"
         print(f"[SYNC] HERMES_DATASET_REPO not set — auto-derived from HF_TOKEN: {HF_REPO_ID}")
         del _api, _username
     except Exception as e:
@@ -239,7 +239,7 @@ class HermesFullSync:
                     "*.tmp",        # Temp files
                     "*.pid",        # PID files
                     "__pycache__",  # Python cache
-                    "scripts/*",    # HuggingHermes scripts — from git, not data
+                    "scripts/*",    # HermesFace scripts — from git, not data
                 ],
             )
             print(f"[SYNC] Upload completed at {datetime.now().isoformat()}")
@@ -419,23 +419,15 @@ class HermesFullSync:
             dashboard_cmd, "Dashboard", env, log_dir / "dashboard.log"
         )
 
-        # ── 3. Start gateway in background if messaging tokens are set ─
-        has_messaging = any(os.environ.get(k) for k in [
-            "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
-            "WHATSAPP_ENABLED", "SIGNAL_ENABLED",
-        ])
-        if has_messaging:
-            time.sleep(2)  # Let dashboard bind 7860 first
-            gateway_env = env.copy()
-            gateway_cmd = [hermes_bin, "gateway"]
-            print(f"[SYNC] Starting gateway (messaging platforms)...")
-            self.gateway_proc = self._start_process(
-                gateway_cmd, "Gateway", gateway_env, log_dir / "gateway.log"
-            )
-        else:
-            print("[SYNC] No messaging tokens configured — gateway skipped")
-            print("[SYNC] Set TELEGRAM_BOT_TOKEN etc. in Space Secrets to enable messaging")
-            self.gateway_proc = None
+        # ── 3. Start gateway in background (messaging platforms + cron) ─
+        time.sleep(2)  # Let dashboard bind 7860 first
+        gateway_env = env.copy()
+        gateway_env["GATEWAY_ALLOW_ALL_USERS"] = "true"
+        gateway_cmd = [hermes_bin, "gateway"]
+        print(f"[SYNC] Starting gateway (messaging platforms)...")
+        self.gateway_proc = self._start_process(
+            gateway_cmd, "Gateway", gateway_env, log_dir / "gateway.log"
+        )
 
         return dashboard_proc
 

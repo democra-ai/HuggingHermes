@@ -1,4 +1,4 @@
-# HuggingHermes on Hugging Face Spaces — Source build
+# HermesFace on Hugging Face Spaces — Source build
 # Builds Hermes Agent from source since no pre-built Docker image is published
 # Rebuild 2026-04-13: initial release
 
@@ -69,7 +69,7 @@ RUN mkdir -p /opt/data/cron /opt/data/sessions /opt/data/logs /opt/data/hooks \
 
 USER hermes
 
-# ── HuggingHermes scripts (persistence + entrypoint) ────────────────────
+# ── HermesFace scripts (persistence + entrypoint) ────────────────────
 ARG CACHE_BUST=2026-04-13-v1
 RUN echo "Build: ${CACHE_BUST}"
 COPY --chown=hermes:hermes scripts /opt/data/scripts
