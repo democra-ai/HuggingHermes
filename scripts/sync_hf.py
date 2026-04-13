@@ -21,7 +21,6 @@ import json
 import shutil
 import tempfile
 import traceback
-import yaml
 from pathlib import Path
 from datetime import datetime
 # Set timeout BEFORE importing huggingface_hub
@@ -58,19 +57,20 @@ class TeeLogger:
 
 HF_TOKEN      = os.environ.get("HF_TOKEN")
 HERMES_DATA   = Path("/opt/data")
-APP_DIR       = Path("/app/hermes")
+APP_DIR       = Path("/opt/hermes")
 DATASET_PATH  = "hermes_data"
 
 AGENT_NAME = os.environ.get("AGENT_NAME", "HuggingHermes")
 
-# HF Spaces built-in env vars
+# HF Spaces built-in env vars (auto-set by HF runtime)
 SPACE_HOST = os.environ.get("SPACE_HOST", "")
 SPACE_ID   = os.environ.get("SPACE_ID", "")
 
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "60"))
 AUTO_CREATE_DATASET = os.environ.get("AUTO_CREATE_DATASET", "true").lower() in ("true", "1", "yes")
 
-# Dataset repo: auto-derive from SPACE_ID when not explicitly set
+# Dataset repo: auto-derive from SPACE_ID when not explicitly set.
+# Format: {username}/{SpaceName}-data
 HF_REPO_ID = os.environ.get("HERMES_DATASET_REPO", "")
 if not HF_REPO_ID and SPACE_ID:
     HF_REPO_ID = f"{SPACE_ID}-data"
@@ -107,7 +107,7 @@ class HermesFullSync:
             print("[SYNC] WARNING: HF_TOKEN not set. Persistence disabled.")
             return
         if not HF_REPO_ID:
-            print("[SYNC] WARNING: Could not determine dataset repo.")
+            print("[SYNC] WARNING: Could not determine dataset repo (no SPACE_ID or HERMES_DATASET_REPO).")
             print("[SYNC] Persistence disabled.")
             return
 
@@ -118,7 +118,7 @@ class HermesFullSync:
     # ── Repo management ────────────────────────────────────────────────
 
     def _ensure_repo_exists(self):
-        """Check if dataset repo exists; auto-create when AUTO_CREATE_DATASET=true."""
+        """Check if dataset repo exists; auto-create only when AUTO_CREATE_DATASET=true."""
         try:
             self.api.repo_info(repo_id=HF_REPO_ID, repo_type="dataset")
             print(f"[SYNC] Dataset repo found: {HF_REPO_ID}")
@@ -199,7 +199,7 @@ class HermesFullSync:
     # ── Save (periodic + shutdown) ─────────────────────────────────────
 
     def save_to_repo(self):
-        """Upload entire /opt/data directory → dataset"""
+        """Upload entire /opt/data directory → dataset (all files, no filtering)"""
         if not self.enabled:
             return
         if not HERMES_DATA.exists():
@@ -234,11 +234,12 @@ class HermesFullSync:
                 token=HF_TOKEN,
                 commit_message=f"Sync hermes_data — {datetime.now().isoformat()}",
                 ignore_patterns=[
-                    "*.log",
-                    "*.lock",
-                    "*.tmp",
-                    "*.pid",
-                    "__pycache__",
+                    "*.log",        # Log files — regenerated on boot
+                    "*.lock",       # Lock files — stale after restart
+                    "*.tmp",        # Temp files
+                    "*.pid",        # PID files
+                    "__pycache__",  # Python cache
+                    "scripts/*",    # HuggingHermes scripts — from git, not data
                 ],
             )
             print(f"[SYNC] Upload completed at {datetime.now().isoformat()}")
@@ -257,49 +258,57 @@ class HermesFullSync:
     # ── Config helpers ─────────────────────────────────────────────────
 
     def _ensure_default_config(self):
-        """Ensure Hermes has a config.yaml and .env for HF Spaces."""
+        """Ensure Hermes has config.yaml and .env for HF Spaces."""
         config_path = HERMES_DATA / "config.yaml"
         env_path = HERMES_DATA / ".env"
-
-        # Generate config.yaml if missing
-        if not config_path.exists():
-            config = {
-                "agent": {
-                    "name": AGENT_NAME,
-                },
-                "server": {
-                    "host": "0.0.0.0",
-                    "port": 7860,
-                },
-            }
-            with open(config_path, "w") as f:
-                yaml.dump(config, f, default_flow_style=False)
-            print(f"[SYNC] Created default config.yaml (agent={AGENT_NAME}, port=7860)")
-
-        # Generate .env if missing — pass through HF Spaces env vars
-        if not env_path.exists():
-            env_lines = []
-            # Pass through all LLM provider keys
-            for key in [
-                "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                "NOUS_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY",
-                "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
-            ]:
-                val = os.environ.get(key, "")
-                if val:
-                    env_lines.append(f"{key}={val}")
-
-            if env_lines:
-                with open(env_path, "w") as f:
-                    f.write("\n".join(env_lines) + "\n")
-                print(f"[SYNC] Created .env with {len(env_lines)} keys")
-
-        # Ensure SOUL.md exists
         soul_path = HERMES_DATA / "SOUL.md"
+
+        # Bootstrap from Hermes templates if available
+        if not config_path.exists():
+            template = APP_DIR / "cli-config.yaml.example"
+            if template.exists():
+                shutil.copy2(str(template), str(config_path))
+                print("[SYNC] Created config.yaml from Hermes template")
+            else:
+                # Minimal fallback config
+                import yaml
+                config = {
+                    "agent": {"name": AGENT_NAME},
+                    "server": {"host": "0.0.0.0", "port": 7860},
+                }
+                with open(config_path, "w") as f:
+                    yaml.dump(config, f, default_flow_style=False)
+                print(f"[SYNC] Created minimal config.yaml (agent={AGENT_NAME}, port=7860)")
+
+        if not env_path.exists():
+            template = APP_DIR / ".env.example"
+            if template.exists():
+                shutil.copy2(str(template), str(env_path))
+                print("[SYNC] Created .env from Hermes template")
+            else:
+                env_lines = []
+                for key in [
+                    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                    "NOUS_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY",
+                    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+                ]:
+                    val = os.environ.get(key, "")
+                    if val:
+                        env_lines.append(f"{key}={val}")
+                if env_lines:
+                    with open(env_path, "w") as f:
+                        f.write("\n".join(env_lines) + "\n")
+                    print(f"[SYNC] Created .env with {len(env_lines)} keys")
+
         if not soul_path.exists():
-            with open(soul_path, "w") as f:
-                f.write(f"# {AGENT_NAME}\n\nI am {AGENT_NAME}, a self-improving AI assistant powered by Hermes Agent.\n")
-            print(f"[SYNC] Created default SOUL.md")
+            template = APP_DIR / "docker" / "SOUL.md"
+            if template.exists():
+                shutil.copy2(str(template), str(soul_path))
+                print("[SYNC] Created SOUL.md from Hermes template")
+            else:
+                with open(soul_path, "w") as f:
+                    f.write(f"# {AGENT_NAME}\n\nI am {AGENT_NAME}, a self-improving AI assistant powered by Hermes Agent.\n")
+                print("[SYNC] Created default SOUL.md")
 
     def _debug_list_files(self):
         try:
@@ -321,32 +330,28 @@ class HermesFullSync:
     # ── Application runner ─────────────────────────────────────────────
 
     def run_hermes(self):
+        """Start Hermes Agent process."""
         log_file = HERMES_DATA / "logs" / "startup.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Determine how to launch Hermes
-        # Priority: hermes CLI > python -m gateway.run > run_agent.py
+        if not APP_DIR.exists():
+            print(f"[SYNC] ERROR: App directory does not exist: {APP_DIR}")
+            return None
+
+        # Determine entry point — same order as Hermes docker/entrypoint.sh
         hermes_bin = shutil.which("hermes")
         venv_hermes = APP_DIR / ".venv" / "bin" / "hermes"
         gateway_run = APP_DIR / "gateway" / "run.py"
         run_agent = APP_DIR / "run_agent.py"
-        docker_entrypoint = APP_DIR / "docker" / "entrypoint.sh"
 
         if hermes_bin:
             entry_cmd = [hermes_bin, "gateway"]
-            print(f"[SYNC] Using hermes CLI: {hermes_bin}")
         elif venv_hermes.exists():
             entry_cmd = [str(venv_hermes), "gateway"]
-            print(f"[SYNC] Using venv hermes: {venv_hermes}")
         elif gateway_run.exists():
             entry_cmd = [sys.executable, str(gateway_run)]
-            print(f"[SYNC] Using gateway/run.py")
         elif run_agent.exists():
             entry_cmd = [sys.executable, str(run_agent)]
-            print(f"[SYNC] Using run_agent.py")
-        elif docker_entrypoint.exists():
-            entry_cmd = ["bash", str(docker_entrypoint)]
-            print(f"[SYNC] Using docker/entrypoint.sh")
         else:
             print(f"[SYNC] ERROR: No Hermes entry point found in {APP_DIR}")
             try:
@@ -357,12 +362,12 @@ class HermesFullSync:
 
         print(f"[SYNC] Launching: {' '.join(entry_cmd)}")
         print(f"[SYNC] Working directory: {APP_DIR}")
+        print(f"[SYNC] Log file: {log_file}")
 
         log_fh = open(log_file, "a")
 
-        # Pass entire environment to Hermes
+        # Pass entire environment to Hermes (all API keys are already in os.environ)
         env = os.environ.copy()
-        env["HERMES_DATA_DIR"] = str(HERMES_DATA)
         env["HERMES_HOME"] = str(HERMES_DATA)
 
         try:
@@ -384,10 +389,9 @@ class HermesFullSync:
                         stripped = line.strip()
                         if not stripped:
                             continue
-                        # Skip noisy lines
                         if any(skip in stripped for skip in [
                             'Downloading', 'Fetching', '%|', '━', '───',
-                            'Already cached', 'Using cache',
+                            'Already cached', 'Using cache', 'tokenizer',
                             '.safetensors', 'model-', 'shard',
                         ]):
                             continue
@@ -430,7 +434,7 @@ def main():
         t = threading.Thread(target=sync.background_sync_loop, args=(stop_event,), daemon=True)
         t.start()
 
-        # 3. Start Hermes
+        # 3. Start application
         t0 = time.time()
         process = sync.run_hermes()
         print(f"[TIMER] run_hermes launch: {time.time() - t0:.1f}s")
