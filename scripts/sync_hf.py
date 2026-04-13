@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+Hermes Agent HF Spaces Persistence — Full Directory Sync
+=========================================================
+
+Simplified persistence: upload/download the entire /opt/data directory
+as-is to/from a Hugging Face Dataset repo.
+
+- Startup:  snapshot_download  →  /opt/data
+- Periodic: upload_folder      →  dataset hermes_data/
+- Shutdown: final upload_folder →  dataset hermes_data/
+"""
+
+import os
+import sys
+import time
+import threading
+import subprocess
+import signal
+import json
+import shutil
+import tempfile
+import traceback
+import yaml
+from pathlib import Path
+from datetime import datetime
+# Set timeout BEFORE importing huggingface_hub
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+os.environ.setdefault("HF_HUB_UPLOAD_TIMEOUT", "600")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "warning")
+
+import logging as _logging
+_logging.getLogger("huggingface_hub").setLevel(_logging.WARNING)
+_logging.getLogger("huggingface_hub.utils").setLevel(_logging.WARNING)
+_logging.getLogger("filelock").setLevel(_logging.WARNING)
+
+from huggingface_hub import HfApi, snapshot_download
+
+# ── Logging helper ──────────────────────────────────────────────────────────
+
+class TeeLogger:
+    """Duplicate output to stream and file."""
+    def __init__(self, filename, stream):
+        self.stream = stream
+        self.file = open(filename, "a", encoding="utf-8")
+    def write(self, message):
+        self.stream.write(message)
+        self.file.write(message)
+        self.flush()
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+    def fileno(self):
+        return self.stream.fileno()
+
+# ── Configuration ───────────────────────────────────────────────────────────
+
+HF_TOKEN      = os.environ.get("HF_TOKEN")
+HERMES_DATA   = Path("/opt/data")
+APP_DIR       = Path("/app/hermes")
+DATASET_PATH  = "hermes_data"
+
+AGENT_NAME = os.environ.get("AGENT_NAME", "HuggingHermes")
+
+# HF Spaces built-in env vars
+SPACE_HOST = os.environ.get("SPACE_HOST", "")
+SPACE_ID   = os.environ.get("SPACE_ID", "")
+
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "60"))
+AUTO_CREATE_DATASET = os.environ.get("AUTO_CREATE_DATASET", "true").lower() in ("true", "1", "yes")
+
+# Dataset repo: auto-derive from SPACE_ID when not explicitly set
+HF_REPO_ID = os.environ.get("HERMES_DATASET_REPO", "")
+if not HF_REPO_ID and SPACE_ID:
+    HF_REPO_ID = f"{SPACE_ID}-data"
+    print(f"[SYNC] HERMES_DATASET_REPO not set — auto-derived from SPACE_ID: {HF_REPO_ID}")
+elif not HF_REPO_ID and HF_TOKEN:
+    try:
+        _api = HfApi(token=HF_TOKEN)
+        _username = _api.whoami()["name"]
+        HF_REPO_ID = f"{_username}/HuggingHermes-data"
+        print(f"[SYNC] HERMES_DATASET_REPO not set — auto-derived from HF_TOKEN: {HF_REPO_ID}")
+        del _api, _username
+    except Exception as e:
+        print(f"[SYNC] WARNING: Could not derive username from HF_TOKEN: {e}")
+        HF_REPO_ID = ""
+
+# Setup logging
+log_dir = HERMES_DATA / "logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+sys.stdout = TeeLogger(log_dir / "sync.log", sys.stdout)
+sys.stderr = sys.stdout
+
+
+# ── Sync Manager ────────────────────────────────────────────────────────────
+
+class HermesFullSync:
+    """Upload/download the entire /opt/data directory to HF Dataset."""
+
+    def __init__(self):
+        self.enabled = False
+        self.dataset_exists = False
+        self.api = None
+
+        if not HF_TOKEN:
+            print("[SYNC] WARNING: HF_TOKEN not set. Persistence disabled.")
+            return
+        if not HF_REPO_ID:
+            print("[SYNC] WARNING: Could not determine dataset repo.")
+            print("[SYNC] Persistence disabled.")
+            return
+
+        self.enabled = True
+        self.api = HfApi(token=HF_TOKEN)
+        self.dataset_exists = self._ensure_repo_exists()
+
+    # ── Repo management ────────────────────────────────────────────────
+
+    def _ensure_repo_exists(self):
+        """Check if dataset repo exists; auto-create when AUTO_CREATE_DATASET=true."""
+        try:
+            self.api.repo_info(repo_id=HF_REPO_ID, repo_type="dataset")
+            print(f"[SYNC] Dataset repo found: {HF_REPO_ID}")
+            return True
+        except Exception:
+            if not AUTO_CREATE_DATASET:
+                print(f"[SYNC] Dataset repo NOT found: {HF_REPO_ID}")
+                print(f"[SYNC]   Set AUTO_CREATE_DATASET=true to auto-create.")
+                print(f"[SYNC] Persistence disabled (app will still run normally).")
+                return False
+            print(f"[SYNC] Dataset repo NOT found: {HF_REPO_ID} — creating...")
+            try:
+                self.api.create_repo(
+                    repo_id=HF_REPO_ID,
+                    repo_type="dataset",
+                    private=True,
+                )
+                print(f"[SYNC] Dataset repo created: {HF_REPO_ID}")
+                return True
+            except Exception as e:
+                print(f"[SYNC] Failed to create dataset repo: {e}")
+                return False
+
+    # ── Restore (startup) ─────────────────────────────────────────────
+
+    def load_from_repo(self):
+        """Download from dataset → /opt/data"""
+        if not self.enabled:
+            print("[SYNC] Persistence disabled - skipping restore")
+            self._ensure_default_config()
+            return
+
+        if not self.dataset_exists:
+            print(f"[SYNC] Dataset {HF_REPO_ID} does not exist - starting fresh")
+            self._ensure_default_config()
+            return
+
+        print(f"[SYNC] Restoring /opt/data from dataset {HF_REPO_ID} ...")
+        HERMES_DATA.mkdir(parents=True, exist_ok=True)
+
+        try:
+            files = self.api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
+            data_files = [f for f in files if f.startswith(f"{DATASET_PATH}/")]
+            if not data_files:
+                print(f"[SYNC] No {DATASET_PATH}/ folder in dataset. Starting fresh.")
+                self._ensure_default_config()
+                return
+
+            print(f"[SYNC] Found {len(data_files)} files under {DATASET_PATH}/ in dataset")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                snapshot_download(
+                    repo_id=HF_REPO_ID,
+                    repo_type="dataset",
+                    allow_patterns=f"{DATASET_PATH}/**",
+                    local_dir=tmpdir,
+                    token=HF_TOKEN,
+                )
+                downloaded_root = Path(tmpdir) / DATASET_PATH
+                if downloaded_root.exists():
+                    for item in downloaded_root.rglob("*"):
+                        if item.is_file():
+                            rel = item.relative_to(downloaded_root)
+                            dest = HERMES_DATA / rel
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(str(item), str(dest))
+                    print("[SYNC] Restore completed.")
+                else:
+                    print("[SYNC] Downloaded snapshot but dir not found. Starting fresh.")
+
+        except Exception as e:
+            print(f"[SYNC] Restore failed: {e}")
+            traceback.print_exc()
+
+        self._ensure_default_config()
+        self._debug_list_files()
+
+    # ── Save (periodic + shutdown) ─────────────────────────────────────
+
+    def save_to_repo(self):
+        """Upload entire /opt/data directory → dataset"""
+        if not self.enabled:
+            return
+        if not HERMES_DATA.exists():
+            print("[SYNC] /opt/data does not exist, nothing to save.")
+            return
+
+        if not self._ensure_repo_exists():
+            print(f"[SYNC] Dataset {HF_REPO_ID} unavailable - skipping save")
+            return
+
+        print(f"[SYNC] Uploading /opt/data → dataset {HF_REPO_ID}/{DATASET_PATH}/ ...")
+
+        try:
+            total_size = 0
+            file_count = 0
+            for root, dirs, fls in os.walk(HERMES_DATA):
+                for fn in fls:
+                    fp = os.path.join(root, fn)
+                    total_size += os.path.getsize(fp)
+                    file_count += 1
+            print(f"[SYNC] Uploading: {file_count} files, {total_size} bytes total")
+
+            if file_count == 0:
+                print("[SYNC] Nothing to upload.")
+                return
+
+            self.api.upload_folder(
+                folder_path=str(HERMES_DATA),
+                path_in_repo=DATASET_PATH,
+                repo_id=HF_REPO_ID,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                commit_message=f"Sync hermes_data — {datetime.now().isoformat()}",
+                ignore_patterns=[
+                    "*.log",
+                    "*.lock",
+                    "*.tmp",
+                    "*.pid",
+                    "__pycache__",
+                ],
+            )
+            print(f"[SYNC] Upload completed at {datetime.now().isoformat()}")
+
+            try:
+                files = self.api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
+                data_files = [f for f in files if f.startswith(f"{DATASET_PATH}/")]
+                print(f"[SYNC] Dataset now has {len(data_files)} files under {DATASET_PATH}/")
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"[SYNC] Upload failed: {e}")
+            traceback.print_exc()
+
+    # ── Config helpers ─────────────────────────────────────────────────
+
+    def _ensure_default_config(self):
+        """Ensure Hermes has a config.yaml and .env for HF Spaces."""
+        config_path = HERMES_DATA / "config.yaml"
+        env_path = HERMES_DATA / ".env"
+
+        # Generate config.yaml if missing
+        if not config_path.exists():
+            config = {
+                "agent": {
+                    "name": AGENT_NAME,
+                },
+                "server": {
+                    "host": "0.0.0.0",
+                    "port": 7860,
+                },
+            }
+            with open(config_path, "w") as f:
+                yaml.dump(config, f, default_flow_style=False)
+            print(f"[SYNC] Created default config.yaml (agent={AGENT_NAME}, port=7860)")
+
+        # Generate .env if missing — pass through HF Spaces env vars
+        if not env_path.exists():
+            env_lines = []
+            # Pass through all LLM provider keys
+            for key in [
+                "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                "NOUS_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY",
+                "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+            ]:
+                val = os.environ.get(key, "")
+                if val:
+                    env_lines.append(f"{key}={val}")
+
+            if env_lines:
+                with open(env_path, "w") as f:
+                    f.write("\n".join(env_lines) + "\n")
+                print(f"[SYNC] Created .env with {len(env_lines)} keys")
+
+        # Ensure SOUL.md exists
+        soul_path = HERMES_DATA / "SOUL.md"
+        if not soul_path.exists():
+            with open(soul_path, "w") as f:
+                f.write(f"# {AGENT_NAME}\n\nI am {AGENT_NAME}, a self-improving AI assistant powered by Hermes Agent.\n")
+            print(f"[SYNC] Created default SOUL.md")
+
+    def _debug_list_files(self):
+        try:
+            count = sum(1 for _, _, files in os.walk(HERMES_DATA) for _ in files)
+            print(f"[SYNC] Local /opt/data: {count} files")
+        except Exception as e:
+            print(f"[SYNC] listing failed: {e}")
+
+    # ── Background sync loop ──────────────────────────────────────────
+
+    def background_sync_loop(self, stop_event):
+        print(f"[SYNC] Background sync started (interval={SYNC_INTERVAL}s)")
+        while not stop_event.is_set():
+            if stop_event.wait(timeout=SYNC_INTERVAL):
+                break
+            print(f"[SYNC] Periodic sync triggered at {datetime.now().isoformat()}")
+            self.save_to_repo()
+
+    # ── Application runner ─────────────────────────────────────────────
+
+    def run_hermes(self):
+        log_file = HERMES_DATA / "logs" / "startup.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Determine how to launch Hermes
+        # Priority: hermes CLI > python -m gateway.run > run_agent.py
+        hermes_bin = shutil.which("hermes")
+        venv_hermes = APP_DIR / ".venv" / "bin" / "hermes"
+        gateway_run = APP_DIR / "gateway" / "run.py"
+        run_agent = APP_DIR / "run_agent.py"
+        docker_entrypoint = APP_DIR / "docker" / "entrypoint.sh"
+
+        if hermes_bin:
+            entry_cmd = [hermes_bin, "gateway"]
+            print(f"[SYNC] Using hermes CLI: {hermes_bin}")
+        elif venv_hermes.exists():
+            entry_cmd = [str(venv_hermes), "gateway"]
+            print(f"[SYNC] Using venv hermes: {venv_hermes}")
+        elif gateway_run.exists():
+            entry_cmd = [sys.executable, str(gateway_run)]
+            print(f"[SYNC] Using gateway/run.py")
+        elif run_agent.exists():
+            entry_cmd = [sys.executable, str(run_agent)]
+            print(f"[SYNC] Using run_agent.py")
+        elif docker_entrypoint.exists():
+            entry_cmd = ["bash", str(docker_entrypoint)]
+            print(f"[SYNC] Using docker/entrypoint.sh")
+        else:
+            print(f"[SYNC] ERROR: No Hermes entry point found in {APP_DIR}")
+            try:
+                print(f"[SYNC]   Contents: {list(APP_DIR.iterdir())[:20]}")
+            except Exception:
+                pass
+            return None
+
+        print(f"[SYNC] Launching: {' '.join(entry_cmd)}")
+        print(f"[SYNC] Working directory: {APP_DIR}")
+
+        log_fh = open(log_file, "a")
+
+        # Pass entire environment to Hermes
+        env = os.environ.copy()
+        env["HERMES_DATA_DIR"] = str(HERMES_DATA)
+        env["HERMES_HOME"] = str(HERMES_DATA)
+
+        try:
+            process = subprocess.Popen(
+                entry_cmd,
+                cwd=str(APP_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+
+            def copy_output():
+                try:
+                    for line in process.stdout:
+                        log_fh.write(line)
+                        log_fh.flush()
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        # Skip noisy lines
+                        if any(skip in stripped for skip in [
+                            'Downloading', 'Fetching', '%|', '━', '───',
+                            'Already cached', 'Using cache',
+                            '.safetensors', 'model-', 'shard',
+                        ]):
+                            continue
+                        print(line, end='')
+                except Exception as e:
+                    print(f"[SYNC] Output copy error: {e}")
+                finally:
+                    log_fh.close()
+
+            thread = threading.Thread(target=copy_output, daemon=True)
+            thread.start()
+
+            print(f"[SYNC] Process started with PID: {process.pid}")
+            return process
+
+        except Exception as e:
+            log_fh.close()
+            print(f"[SYNC] ERROR: Failed to start process: {e}")
+            traceback.print_exc()
+            return None
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    try:
+        t_main_start = time.time()
+
+        t0 = time.time()
+        sync = HermesFullSync()
+        print(f"[TIMER] sync_hf init: {time.time() - t0:.1f}s")
+
+        # 1. Restore
+        t0 = time.time()
+        sync.load_from_repo()
+        print(f"[TIMER] load_from_repo (restore): {time.time() - t0:.1f}s")
+
+        # 2. Background sync
+        stop_event = threading.Event()
+        t = threading.Thread(target=sync.background_sync_loop, args=(stop_event,), daemon=True)
+        t.start()
+
+        # 3. Start Hermes
+        t0 = time.time()
+        process = sync.run_hermes()
+        print(f"[TIMER] run_hermes launch: {time.time() - t0:.1f}s")
+        print(f"[TIMER] Total startup (init → app launched): {time.time() - t_main_start:.1f}s")
+
+        # Signal handler
+        def handle_signal(sig, frame):
+            print(f"\n[SYNC] Signal {sig} received. Shutting down...")
+            stop_event.set()
+            t.join(timeout=10)
+            if process:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            print("[SYNC] Final sync...")
+            sync.save_to_repo()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+
+        # Wait
+        if process is None:
+            print("[SYNC] ERROR: Failed to start Hermes process. Exiting.")
+            stop_event.set()
+            t.join(timeout=5)
+            sys.exit(1)
+
+        exit_code = process.wait()
+        print(f"[SYNC] Hermes exited with code {exit_code}")
+        stop_event.set()
+        t.join(timeout=10)
+        print("[SYNC] Final sync...")
+        sync.save_to_repo()
+        sys.exit(exit_code)
+
+    except Exception as e:
+        print(f"[SYNC] FATAL ERROR in main: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

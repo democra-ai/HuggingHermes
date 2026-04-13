@@ -1,0 +1,13 @@
+# Environment and secrets
+.env
+.env.local
+*.pem
+
+# Dependencies and build
+node_modules/
+__pycache__/
+*.pyc
+
+# Logs and temp
+*.log
+.DS_Store
